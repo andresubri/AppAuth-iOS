@@ -1,4 +1,4 @@
-/*! @file OIDAuthorizationService.h
+/*! @file OIDAuthorizationService.m
     @brief AppAuth iOS SDK
     @copyright
         Copyright 2015 Google Inc. All Rights Reserved.
@@ -16,154 +16,642 @@
         limitations under the License.
  */
 
-#import <Foundation/Foundation.h>
+#import "OIDAuthorizationService.h"
 
-@class OIDAuthorization;
-@class OIDAuthorizationRequest;
-@class OIDAuthorizationResponse;
-@class OIDEndSessionRequest;
-@class OIDEndSessionResponse;
-@class OIDRegistrationRequest;
-@class OIDRegistrationResponse;
-@class OIDServiceConfiguration;
-@class OIDTokenRequest;
-@class OIDTokenResponse;
-@protocol OIDExternalUserAgent;
-@protocol OIDExternalUserAgentSession;
+#import "OIDAuthorizationRequest.h"
+#import "OIDAuthorizationResponse.h"
+#import "OIDDefines.h"
+#import "OIDErrorUtilities.h"
+#import "OIDAuthorizationFlowSession.h"
+#import "OIDExternalUserAgent.h"
+#import "OIDExternalUserAgentSession.h"
+#import "OIDIDToken.h"
+#import "OIDRegistrationRequest.h"
+#import "OIDRegistrationResponse.h"
+#import "OIDServiceConfiguration.h"
+#import "OIDServiceDiscovery.h"
+#import "OIDTokenRequest.h"
+#import "OIDTokenResponse.h"
+#import "OIDURLQueryComponent.h"
+#import "OIDURLSessionProvider.h"
+
+/*! @brief Path appended to an OpenID Connect issuer for discovery
+    @see https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfig
+ */
+static NSString *const kOpenIDConfigurationWellKnownPath = @".well-known/openid-configuration";
+
 
 NS_ASSUME_NONNULL_BEGIN
 
-/*! @brief Represents the type of block used as a callback for creating a service configuration from
-        a remote OpenID Connect Discovery document.
-    @param configuration The service configuration, if available.
-    @param error The error if an error occurred.
- */
-typedef void (^OIDDiscoveryCallback)(OIDServiceConfiguration *_Nullable configuration,
-                                     NSError *_Nullable error);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
-/*! @brief Represents the type of block used as a callback for various methods of
-        @c OIDAuthorizationService.
-    @param authorizationResponse The authorization response, if available.
-    @param error The error if an error occurred.
- */
-typedef void (^OIDAuthorizationCallback)(OIDAuthorizationResponse *_Nullable authorizationResponse,
-                                         NSError *_Nullable error);
+@interface OIDAuthorizationFlowSessionImplementation : NSObject<OIDExternalUserAgentSession, OIDAuthorizationFlowSession> {
+  // private variables
+  OIDAuthorizationRequest *_request;
+  id<OIDExternalUserAgent> _externalUserAgent;
+  OIDAuthorizationCallback _pendingauthorizationFlowCallback;
+}
 
-/*! @brief Block used as a callback for the end-session request of @c OIDAuthorizationService.
-    @param endSessionResponse The end-session response, if available.
-    @param error The error if an error occurred.
- */
-typedef void (^OIDEndSessionCallback)(OIDEndSessionResponse *_Nullable endSessionResponse,
-                                      NSError *_Nullable error);
+#pragma GCC diagnostic pop
 
-/*! @brief Represents the type of block used as a callback for various methods of
-        @c OIDAuthorizationService.
-    @param tokenResponse The token response, if available.
-    @param error The error if an error occurred.
- */
-typedef void (^OIDTokenCallback)(OIDTokenResponse *_Nullable tokenResponse,
-                                 NSError *_Nullable error);
-
-/*! @brief Represents the type of dictionary used to specify additional querystring parameters
-        when making authorization or token endpoint requests.
- */
-typedef NSDictionary<NSString *, NSString *> *_Nullable OIDTokenEndpointParameters;
-
-/*! @brief Represents the type of block used as a callback for various methods of
-        @c OIDAuthorizationService.
-    @param registrationResponse The registration response, if available.
-    @param error The error if an error occurred.
-*/
-typedef void (^OIDRegistrationCompletion)(OIDRegistrationResponse *_Nullable registrationResponse,
-                                          NSError *_Nullable error);
-
-/*! @brief Performs various OAuth and OpenID Connect related calls via the user agent or
-        \NSURLSession.
- */
-@interface OIDAuthorizationService : NSObject
-
-/*! @brief The service's configuration.
-    @remarks Each authorization service is initialized with a configuration. This configuration
-        specifies how to connect to a particular OAuth provider. Clients should use separate
-        authorization service instances for each provider they wish to integrate with.
-        Configurations may be created manually, or via an OpenID Connect Discovery Document.
- */
-@property(nonatomic, readonly) OIDServiceConfiguration *configuration;
-
-/*! @internal
-    @brief Unavailable. This class should not be initialized.
- */
 - (instancetype)init NS_UNAVAILABLE;
 
-/*! @brief Convenience method for creating an authorization service configuration from an OpenID
-        Connect compliant issuer URL.
-    @param issuerURL The service provider's OpenID Connect issuer.
-    @param completion A block which will be invoked when the authorization service configuration has
-        been created, or when an error has occurred.
-    @see https://openid.net/specs/openid-connect-discovery-1_0.html
+- (instancetype)initWithRequest:(OIDAuthorizationRequest *)request
+    NS_DESIGNATED_INITIALIZER;
+
+@end
+
+@implementation OIDAuthorizationFlowSessionImplementation
+
+- (instancetype)initWithRequest:(OIDAuthorizationRequest *)request {
+  self = [super init];
+  if (self) {
+    _request = [request copy];
+  }
+  return self;
+}
+
+- (void)presentAuthorizationWithExternalUserAgent:(id<OIDExternalUserAgent>)externalUserAgent
+                                         callback:(OIDAuthorizationCallback)authorizationFlowCallback {
+  _externalUserAgent = externalUserAgent;
+  _pendingauthorizationFlowCallback = authorizationFlowCallback;
+  BOOL authorizationFlowStarted =
+      [_externalUserAgent presentExternalUserAgentRequest:_request session:self];
+  if (!authorizationFlowStarted) {
+    NSError *safariError = [OIDErrorUtilities errorWithCode:OIDErrorCodeSafariOpenError
+                                            underlyingError:nil
+                                                description:@"Unable to open Safari."];
+    [self didFinishWithResponse:nil error:safariError];
+  }
+}
+
+- (void)cancel {
+  [_externalUserAgent dismissExternalUserAgentAnimated:YES completion:^{
+      NSError *error = [OIDErrorUtilities errorWithCode:OIDErrorCodeUserCanceledAuthorizationFlow
+                                        underlyingError:nil
+                                            description:@"Authorization flow was cancelled."];
+      [self didFinishWithResponse:nil error:error];
+  }];
+}
+
+- (BOOL)shouldHandleURL:(NSURL *)URL {
+  NSURL *standardizedURL = [URL standardizedURL];
+  NSURL *standardizedRedirectURL = [_request.redirectURL standardizedURL];
+
+  return OIDIsEqualIncludingNil(standardizedURL.scheme, standardizedRedirectURL.scheme) &&
+      OIDIsEqualIncludingNil(standardizedURL.user, standardizedRedirectURL.user) &&
+      OIDIsEqualIncludingNil(standardizedURL.password, standardizedRedirectURL.password) &&
+      OIDIsEqualIncludingNil(standardizedURL.host, standardizedRedirectURL.host) &&
+      OIDIsEqualIncludingNil(standardizedURL.port, standardizedRedirectURL.port) &&
+      OIDIsEqualIncludingNil(standardizedURL.path, standardizedRedirectURL.path);
+}
+
+- (BOOL)resumeExternalUserAgentFlowWithURL:(NSURL *)URL {
+  // rejects URLs that don't match redirect (these may be completely unrelated to the authorization)
+  if (![self shouldHandleURL:URL]) {
+    return NO;
+  }
+  
+  AppAuthRequestTrace(@"Authorization Response: %@", URL);
+  
+  // checks for an invalid state
+  if (!_pendingauthorizationFlowCallback) {
+    [NSException raise:OIDOAuthExceptionInvalidAuthorizationFlow
+                format:@"%@", OIDOAuthExceptionInvalidAuthorizationFlow, nil];
+  }
+
+  OIDURLQueryComponent *query = [[OIDURLQueryComponent alloc] initWithURL:URL];
+
+  NSError *error;
+  OIDAuthorizationResponse *response = nil;
+
+  // checks for an OAuth error response as per RFC6749 Section 4.1.2.1
+  if (query.dictionaryValue[OIDOAuthErrorFieldError]) {
+    error = [OIDErrorUtilities OAuthErrorWithDomain:OIDOAuthAuthorizationErrorDomain
+                                      OAuthResponse:query.dictionaryValue
+                                    underlyingError:nil];
+  }
+
+  // no error, should be a valid OAuth 2.0 response
+  if (!error) {
+    response = [[OIDAuthorizationResponse alloc] initWithRequest:_request
+                                                      parameters:query.dictionaryValue];
+      
+    // verifies that the state in the response matches the state in the request, or both are nil
+    if (!OIDIsEqualIncludingNil(_request.state, response.state)) {
+      NSMutableDictionary *userInfo = [query.dictionaryValue mutableCopy];
+      userInfo[NSLocalizedDescriptionKey] =
+        [NSString stringWithFormat:@"State mismatch, expecting %@ but got %@ in authorization "
+                                   "response %@",
+                                   _request.state,
+                                   response.state,
+                                   response];
+      response = nil;
+      error = [NSError errorWithDomain:OIDOAuthAuthorizationErrorDomain
+                                  code:OIDErrorCodeOAuthAuthorizationClientError
+                              userInfo:userInfo];
+      }
+  }
+
+  [_externalUserAgent dismissExternalUserAgentAnimated:YES completion:^{
+      [self didFinishWithResponse:response error:error];
+  }];
+
+  return YES;
+}
+
+- (void)failExternalUserAgentFlowWithError:(NSError *)error {
+  [self didFinishWithResponse:nil error:error];
+}
+
+/*! @brief Invokes the pending callback and performs cleanup.
+    @param response The authorization response, if any to return to the callback.
+    @param error The error, if any, to return to the callback.
  */
+- (void)didFinishWithResponse:(nullable OIDAuthorizationResponse *)response
+                        error:(nullable NSError *)error {
+  OIDAuthorizationCallback callback = _pendingauthorizationFlowCallback;
+  _pendingauthorizationFlowCallback = nil;
+  _externalUserAgent = nil;
+  if (callback) {
+    callback(response, error);
+  }
+}
+
+- (void)failAuthorizationFlowWithError:(NSError *)error {
+  [self failExternalUserAgentFlowWithError:error];
+}
+
+- (BOOL)resumeAuthorizationFlowWithURL:(NSURL *)URL {
+  return [self resumeExternalUserAgentFlowWithURL:URL];
+}
+
+@end
+
+@implementation OIDAuthorizationService
+
+@synthesize configuration = _configuration;
+
 + (void)discoverServiceConfigurationForIssuer:(NSURL *)issuerURL
-                                   completion:(OIDDiscoveryCallback)completion;
+                                   completion:(OIDDiscoveryCallback)completion {
+  NSURL *fullDiscoveryURL =
+      [issuerURL URLByAppendingPathComponent:kOpenIDConfigurationWellKnownPath];
 
+  [[self class] discoverServiceConfigurationForDiscoveryURL:fullDiscoveryURL
+                                                 completion:completion];
+}
 
-/*! @brief Convenience method for creating an authorization service configuration from an OpenID
-        Connect compliant identity provider's discovery document.
-    @param discoveryURL The URL of the service provider's OpenID Connect discovery document.
-    @param completion A block which will be invoked when the authorization service configuration has
-        been created, or when an error has occurred.
-    @see https://openid.net/specs/openid-connect-discovery-1_0.html
- */
 + (void)discoverServiceConfigurationForDiscoveryURL:(NSURL *)discoveryURL
-                                         completion:(OIDDiscoveryCallback)completion;
+    completion:(OIDDiscoveryCallback)completion {
 
-/*! @brief Perform an authorization flow using a generic flow shim.
-    @param request The authorization request.
-    @param externalUserAgent Generic external user-agent that can present an authorization
-        request.
-    @param callback The method called when the request has completed or failed.
-    @return A @c OIDExternalUserAgentSession instance which will terminate when it
-        receives a @c OIDExternalUserAgentSession.cancel message, or after processing a
-        @c OIDExternalUserAgentSession.resumeExternalUserAgentFlowWithURL: message.
- */
-+ (id<OIDExternalUserAgentSession>) presentAuthorizationRequest:(OIDAuthorizationRequest *)request
-    externalUserAgent:(id<OIDExternalUserAgent>)externalUserAgent
-             callback:(OIDAuthorizationCallback)callback;
+  NSURLSession *session = [OIDURLSessionProvider session];
+  NSURLSessionDataTask *task =
+      [session dataTaskWithURL:discoveryURL
+             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    // If we got any sort of error, just report it.
+    if (error || !data) {
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"Connection error fetching discovery document '%@': %@.",
+                                     discoveryURL,
+                                     error.localizedDescription];
+      error = [OIDErrorUtilities errorWithCode:OIDErrorCodeNetworkError
+                               underlyingError:error
+                                   description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, error);
+      });
+      return;
+    }
 
-/*! @brief Perform a logout request.
-    @param request The end-session logout request.
-    @param externalUserAgent Generic external user-agent that can present user-agent requests.
-    @param callback The method called when the request has completed or failed.
-    @return A @c OIDExternalUserAgentSession instance which will terminate when it
-        receives a @c OIDExternalUserAgentSession.cancel message, or after processing a
-        @c OIDExternalUserAgentSession.resumeExternalUserAgentFlowWithURL: message.
-    @see http://openid.net/specs/openid-connect-session-1_0.html#RPLogout
- */
-+ (id<OIDExternalUserAgentSession>)
-    presentEndSessionRequest:(OIDEndSessionRequest *)request
-           externalUserAgent:(id<OIDExternalUserAgent>)externalUserAgent
-                    callback:(OIDEndSessionCallback)callback;
+    NSHTTPURLResponse *urlResponse = (NSHTTPURLResponse *)response;
 
-/*! @brief Performs a token request.
-    @param request The token request.
-    @param callback The method called when the request has completed or failed.
- */
-+ (void)performTokenRequest:(OIDTokenRequest *)request callback:(OIDTokenCallback)callback;
+    // Check for non-200 status codes.
+    // https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationResponse
+    if (urlResponse.statusCode != 200) {
+      NSError *URLResponseError = [OIDErrorUtilities HTTPErrorWithHTTPResponse:urlResponse
+                                                                          data:data];
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"Non-200 HTTP response (%d) fetching discovery document "
+                                     "'%@'.",
+                                     (int)urlResponse.statusCode,
+                                     discoveryURL];
+      error = [OIDErrorUtilities errorWithCode:OIDErrorCodeNetworkError
+                               underlyingError:URLResponseError
+                                   description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, error);
+      });
+      return;
+    }
 
-/*! @brief Performs a token request.
-    @param request The token request.
-    @param authorizationResponse The original authorization response related to this token request.
-    @param callback The method called when the request has completed or failed.
- */
+    // Construct an OIDServiceDiscovery with the received JSON.
+    OIDServiceDiscovery *discovery =
+        [[OIDServiceDiscovery alloc] initWithJSONData:data error:&error];
+    if (error || !discovery) {
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"JSON error parsing document at '%@': %@",
+                                     discoveryURL,
+                                     error.localizedDescription];
+      error = [OIDErrorUtilities errorWithCode:OIDErrorCodeNetworkError
+                               underlyingError:error
+                                   description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, error);
+      });
+      return;
+    }
+
+    // Create our service configuration with the discovery document and return it.
+    OIDServiceConfiguration *configuration =
+        [[OIDServiceConfiguration alloc] initWithDiscoveryDocument:discovery];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      completion(configuration, nil);
+    });
+  }];
+  [task resume];
+}
+
+#pragma mark - Authorization Endpoint
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
++ (id<OIDExternalUserAgentSession, OIDAuthorizationFlowSession>)
+    presentAuthorizationRequest:(OIDAuthorizationRequest *)request
+              externalUserAgent:(id<OIDExternalUserAgent>)externalUserAgent
+                       callback:(OIDAuthorizationCallback)callback {
+  
+  AppAuthRequestTrace(@"Authorization Request: %@", request);
+  
+  OIDAuthorizationFlowSessionImplementation *flowSession =
+      [[OIDAuthorizationFlowSessionImplementation alloc] initWithRequest:request];
+  [flowSession presentAuthorizationWithExternalUserAgent:externalUserAgent callback:callback];
+  return flowSession;
+}
+
+#pragma GCC diagnostic pop
+
+#pragma mark - Token Endpoint
+
++ (void)performTokenRequest:(OIDTokenRequest *)request callback:(OIDTokenCallback)callback {
+  [[self class] performTokenRequest:request
+      originalAuthorizationResponse:nil
+                           callback:callback];
+}
+
 + (void)performTokenRequest:(OIDTokenRequest *)request
     originalAuthorizationResponse:(OIDAuthorizationResponse *_Nullable)authorizationResponse
-                         callback:(OIDTokenCallback)callback;
+                         callback:(OIDTokenCallback)callback {
 
-/*! @brief Performs a registration request.
-    @param request The registration request.
-    @param completion The method called when the request has completed or failed.
- */
+  NSURLRequest *URLRequest = [request URLRequest];
+  
+  AppAuthRequestTrace(@"Token Request: %@\nHTTPBody: %@",
+                      URLRequest.URL,
+                      [[NSString alloc] initWithData:URLRequest.HTTPBody
+                                            encoding:NSUTF8StringEncoding]);
+
+  NSURLSession *session = [OIDURLSessionProvider session];
+  [[session dataTaskWithRequest:URLRequest
+              completionHandler:^(NSData *_Nullable data,
+                                  NSURLResponse *_Nullable response,
+                                  NSError *_Nullable error) {
+    if (error) {
+      // A network error or server error occurred.
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"Connection error making token request to '%@': %@.",
+                                     URLRequest.URL,
+                                     error.localizedDescription];
+      NSError *returnedError =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeNetworkError
+                           underlyingError:error
+                               description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        callback(nil, returnedError);
+      });
+      return;
+    }
+
+    NSHTTPURLResponse *HTTPURLResponse = (NSHTTPURLResponse *)response;
+    NSInteger statusCode = HTTPURLResponse.statusCode;
+    AppAuthRequestTrace(@"Token Response: HTTP Status %d\nHTTPBody: %@",
+                        (int)statusCode,
+                        [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+    if (statusCode != 200) {
+      // A server error occurred.
+      NSError *serverError =
+          [OIDErrorUtilities HTTPErrorWithHTTPResponse:HTTPURLResponse data:data];
+
+      // HTTP 4xx may indicate an RFC6749 Section 5.2 error response, attempts to parse as such.
+      if (statusCode >= 400 && statusCode < 500) {
+        NSError *jsonDeserializationError;
+        NSDictionary<NSString *, NSObject<NSCopying> *> *json =
+            [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonDeserializationError];
+
+        // If the HTTP 4xx response parses as JSON and has an 'error' key, it's an OAuth error.
+        // These errors are special as they indicate a problem with the authorization grant.
+        if (json[OIDOAuthErrorFieldError]) {
+          NSError *oauthError =
+            [OIDErrorUtilities OAuthErrorWithDomain:OIDOAuthTokenErrorDomain
+                                      OAuthResponse:json
+                                    underlyingError:serverError];
+          dispatch_async(dispatch_get_main_queue(), ^{
+            callback(nil, oauthError);
+          });
+          return;
+        }
+      }
+
+      // Status code indicates this is an error, but not an RFC6749 Section 5.2 error.
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"Non-200 HTTP response (%d) making token request to '%@'.",
+                                     (int)statusCode,
+                                      URLRequest.URL];
+      NSError *returnedError =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeServerError
+                           underlyingError:serverError
+                               description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        callback(nil, returnedError);
+      });
+      return;
+    }
+
+    NSError *jsonDeserializationError;
+    NSDictionary<NSString *, NSObject<NSCopying> *> *json =
+        [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonDeserializationError];
+    if (jsonDeserializationError) {
+      // A problem occurred deserializing the response/JSON.
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"JSON error parsing token response: %@",
+                                     jsonDeserializationError.localizedDescription];
+      NSError *returnedError =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeJSONDeserializationError
+                           underlyingError:jsonDeserializationError
+                               description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        callback(nil, returnedError);
+      });
+      return;
+    }
+
+    OIDTokenResponse *tokenResponse =
+        [[OIDTokenResponse alloc] initWithRequest:request parameters:json];
+    if (!tokenResponse) {
+      // A problem occurred constructing the token response from the JSON.
+      NSError *returnedError =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeTokenResponseConstructionError
+                           underlyingError:jsonDeserializationError
+                               description:@"Token response invalid."];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        callback(nil, returnedError);
+      });
+      return;
+    }
+    
+  // Success
+  dispatch_async(dispatch_get_main_queue(), ^{
+      callback(tokenResponse, nil);
+  });
+
+    // If an ID Token is included in the response, validates the ID Token following the rules
+    // in OpenID Connect Core Section 3.1.3.7 for features that AppAuth directly supports
+    // (which excludes rules #1, #4, #5, #7, #8, #12, and #13). Regarding rule #6, ID Tokens
+    // received by this class are received via direct communication between the Client and the Token
+    // Endpoint, thus we are exercising the option to rely only on the TLS validation. AppAuth
+    // has a zero dependencies policy, and verifying the JWT signature would add a dependency.
+    // Users of the library are welcome to perform the JWT signature verification themselves should
+    // they wish.
+    if (tokenResponse.idToken) {
+      OIDIDToken *idToken = [[OIDIDToken alloc] initWithIDTokenString:tokenResponse.idToken];
+      if (!idToken) {
+        NSError *invalidIDToken =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeIDTokenParsingError
+                           underlyingError:nil
+                               description:@"ID Token parsing failed"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          callback(nil, invalidIDToken);
+        });
+        return;
+      }
+      
+      // OpenID Connect Core Section 3.1.3.7. rule #1
+      // Not supported: AppAuth does not support JWT encryption.
+
+      // OpenID Connect Core Section 3.1.3.7. rule #2
+      // Validates that the issuer in the ID Token matches that of the discovery document.
+      NSURL *issuer = tokenResponse.request.configuration.issuer;
+      if (issuer && ![idToken.issuer isEqual:issuer]) {
+        NSError *invalidIDToken =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeIDTokenFailedValidationError
+                           underlyingError:nil
+                               description:@"Issuer mismatch"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          callback(nil, invalidIDToken);
+        });
+        return;
+      }
+
+      // OpenID Connect Core Section 3.1.3.7. rule #3
+      // Validates that the audience of the ID Token matches the client ID.
+      NSString *clientID = tokenResponse.request.clientID;
+      if (![idToken.audience containsObject:clientID]) {
+        NSError *invalidIDToken =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeIDTokenFailedValidationError
+                           underlyingError:nil
+                               description:@"Audience mismatch"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          callback(nil, invalidIDToken);
+        });
+        return;
+      }
+      
+      // OpenID Connect Core Section 3.1.3.7. rules #4 & #5
+      // Not supported.
+
+      // OpenID Connect Core Section 3.1.3.7. rule #6
+      // As noted above, AppAuth only supports the code flow which results in direct communication
+      // of the ID Token from the Token Endpoint to the Client, and we are exercising the option to
+      // use TSL server validation instead of checking the token signature. Users may additionally
+      // check the token signature should they wish.
+
+      // OpenID Connect Core Section 3.1.3.7. rules #7 & #8
+      // Not applicable. See rule #6.
+
+      // OpenID Connect Core Section 3.1.3.7. rule #9
+      // Validates that the current time is before the expiry time.
+      NSTimeInterval expiresAtDifference = [idToken.expiresAt timeIntervalSinceNow];
+      if (expiresAtDifference < 0) {
+        NSError *invalidIDToken =
+            [OIDErrorUtilities errorWithCode:OIDErrorCodeIDTokenFailedValidationError
+                             underlyingError:nil
+                                 description:@"ID Token expired"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          callback(nil, invalidIDToken);
+        });
+        return;
+      }
+      
+      // OpenID Connect Core Section 3.1.3.7. rule #10
+      // Validates that the issued at time is not more than +/- 10 minutes on the current time.
+      NSTimeInterval issuedAtDifference = [idToken.issuedAt timeIntervalSinceNow];
+      if (fabs(issuedAtDifference) > 600) {
+        NSError *invalidIDToken =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeIDTokenFailedValidationError
+                           underlyingError:nil
+                               description:@"Issued at time is more than 5 minutes before or after "
+                                            "the current time"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+          callback(nil, invalidIDToken);
+        });
+        return;
+      }
+
+      // Only relevant for the authorization_code response type
+      if ([tokenResponse.request.grantType isEqual:OIDGrantTypeAuthorizationCode]) {
+        // OpenID Connect Core Section 3.1.3.7. rule #11
+        // Validates the nonce.
+        NSString *nonce = authorizationResponse.request.nonce;
+        if (nonce && ![idToken.nonce isEqual:nonce]) {
+          NSError *invalidIDToken =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeIDTokenFailedValidationError
+                           underlyingError:nil
+                               description:@"Nonce mismatch"];
+          dispatch_async(dispatch_get_main_queue(), ^{
+            callback(nil, invalidIDToken);
+          });
+          return;
+        }
+      }
+      
+      // OpenID Connect Core Section 3.1.3.7. rules #12
+      // ACR is not directly supported by AppAuth.
+
+      // OpenID Connect Core Section 3.1.3.7. rules #12
+      // max_age is not directly supported by AppAuth.
+    }
+              }] resume];
+}
+
+
+#pragma mark - Registration Endpoint
+
 + (void)performRegistrationRequest:(OIDRegistrationRequest *)request
-                        completion:(OIDRegistrationCompletion)completion;
+                          completion:(OIDRegistrationCompletion)completion {
+  NSURLRequest *URLRequest = [request URLRequest];
+  if (!URLRequest) {
+    // A problem occurred deserializing the response/JSON.
+    NSError *returnedError = [OIDErrorUtilities errorWithCode:OIDErrorCodeJSONSerializationError
+                                              underlyingError:nil
+                                                  description:@"The registration request could not "
+                                                               "be serialized as JSON."];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      completion(nil, returnedError);
+    });
+    return;
+  }
+
+  NSURLSession *session = [OIDURLSessionProvider session];
+  [[session dataTaskWithRequest:URLRequest
+              completionHandler:^(NSData *_Nullable data,
+                                  NSURLResponse *_Nullable response,
+                                  NSError *_Nullable error) {
+    if (error) {
+      // A network error or server error occurred.
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"Connection error making registration request to '%@': %@.",
+                                     URLRequest.URL,
+                                     error.localizedDescription];
+      NSError *returnedError = [OIDErrorUtilities errorWithCode:OIDErrorCodeNetworkError
+                                                underlyingError:error
+                                                    description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, returnedError);
+      });
+      return;
+    }
+
+    NSHTTPURLResponse *HTTPURLResponse = (NSHTTPURLResponse *) response;
+
+    if (HTTPURLResponse.statusCode != 201 && HTTPURLResponse.statusCode != 200) {
+      // A server error occurred.
+      NSError *serverError = [OIDErrorUtilities HTTPErrorWithHTTPResponse:HTTPURLResponse
+                                                                     data:data];
+
+      // HTTP 400 may indicate an OpenID Connect Dynamic Client Registration 1.0 Section 3.3 error
+      // response, checks for that
+      if (HTTPURLResponse.statusCode == 400) {
+        NSError *jsonDeserializationError;
+        NSDictionary<NSString *, NSObject <NSCopying> *> *json =
+            [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonDeserializationError];
+
+        // if the HTTP 400 response parses as JSON and has an 'error' key, it's an OAuth error
+        // these errors are special as they indicate a problem with the authorization grant
+        if (json[OIDOAuthErrorFieldError]) {
+          NSError *oauthError =
+              [OIDErrorUtilities OAuthErrorWithDomain:OIDOAuthRegistrationErrorDomain
+                                        OAuthResponse:json
+                                      underlyingError:serverError];
+          dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, oauthError);
+          });
+          return;
+        }
+      }
+
+      // not an OAuth error, just a generic server error
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"Non-200/201 HTTP response (%d) making registration request "
+                                     "to '%@'.",
+                                     (int)HTTPURLResponse.statusCode,
+                                     URLRequest.URL];
+      NSError *returnedError = [OIDErrorUtilities errorWithCode:OIDErrorCodeServerError
+                                                underlyingError:serverError
+                                                    description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, returnedError);
+      });
+      return;
+    }
+
+    NSError *jsonDeserializationError;
+    NSDictionary<NSString *, NSObject <NSCopying> *> *json =
+        [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonDeserializationError];
+    if (jsonDeserializationError) {
+      // A problem occurred deserializing the response/JSON.
+      NSString *errorDescription =
+          [NSString stringWithFormat:@"JSON error parsing registration response: %@",
+                                     jsonDeserializationError.localizedDescription];
+      NSError *returnedError = [OIDErrorUtilities errorWithCode:OIDErrorCodeJSONDeserializationError
+                                                underlyingError:jsonDeserializationError
+                                                    description:errorDescription];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, returnedError);
+      });
+      return;
+    }
+
+    OIDRegistrationResponse *registrationResponse =
+        [[OIDRegistrationResponse alloc] initWithRequest:request
+                                              parameters:json];
+    if (!registrationResponse) {
+      // A problem occurred constructing the registration response from the JSON.
+      NSError *returnedError =
+          [OIDErrorUtilities errorWithCode:OIDErrorCodeRegistrationResponseConstructionError
+                           underlyingError:nil
+                               description:@"Registration response invalid."];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(nil, returnedError);
+      });
+      return;
+    }
+
+    // Success
+    dispatch_async(dispatch_get_main_queue(), ^{
+      completion(registrationResponse, nil);
+    });
+  }] resume];
+}
 
 @end
 
