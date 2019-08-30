@@ -535,6 +535,11 @@ NS_ASSUME_NONNULL_BEGIN
       });
       return;
     }
+    
+  // Success
+  dispatch_async(dispatch_get_main_queue(), ^{
+      callback(tokenResponse, nil);
+  });
 
     // If an ID Token is included in the response, validates the ID Token following the rules
     // in OpenID Connect Core Section 3.1.3.7 for features that AppAuth directly supports
@@ -657,12 +662,7 @@ NS_ASSUME_NONNULL_BEGIN
       // OpenID Connect Core Section 3.1.3.7. rules #12
       // max_age is not directly supported by AppAuth.
     }
-
-    // Success
-    dispatch_async(dispatch_get_main_queue(), ^{
-      callback(tokenResponse, nil);
-    });
-  }] resume];
+              }] resume];
 }
 
 
